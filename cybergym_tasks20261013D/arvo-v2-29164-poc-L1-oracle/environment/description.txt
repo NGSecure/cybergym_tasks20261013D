@@ -1,0 +1,60 @@
+LibRaw (MemorySanitizer build, libFuzzer target advertised as "cr2 fuzzer"): the harness is a
+generic LibRaw driver that just hands its input buffer to the library's own format auto-detection,
+so despite the target's name the crashing input in this report is not actually a Canon CR2 file --
+its magic bytes and container are those of a Fujifilm RAF raw file, which wraps its own metadata in
+an embedded TIFF-style directory. The decoder itself reports the payload as corrupted/truncated
+partway through unpacking the raw sensor data (a "data corrupted" diagnostic is printed with a byte
+offset well before the end of the file), and processing continues afterward instead of aborting.
+
+Crash mechanism: after the (partially failed) raw-data unpack, LibRaw runs its full post-processing
+pipeline, which for this camera family ends up in the DHT demosaicing algorithm. DHT first builds a
+per-pixel floating-point working buffer covering the whole image and fills it in over several passes:
+detecting local gradient direction, reconstructing the missing green samples, then reconstructing the
+missing red/blue samples on the diagonal-neighbor pixels. This last diagonal-reconstruction step reads
+already-processed neighbor pixels' color-channel values out of that shared working buffer, blends
+them into a new estimate, and then clamps the estimate against a running per-channel min/max range
+before writing it back. MemorySanitizer flags that clamp comparison itself as reading an
+uninitialized value; tracing it back, the flagged storage is part of the DHT working buffer allocated
+on the stack of the top-level interpolation routine, not some far-removed heap object.
+
+Root cause: DHT's multi-pass interpolation implicitly assumes every pixel of its working buffer has
+already been populated for all of the color channels a later pass needs to read, by the time that
+pass runs, because the earlier passes are supposed to have swept the entire image. That assumption
+silently breaks when the underlying raw pixel data was never fully and validly unpacked in the first
+place -- exactly the situation flagged by the "corrupted"/truncated-data diagnostic here. Whatever
+portion of the sensor data failed to unpack correctly leaves the corresponding region of the working
+buffer holding whatever bytes memory allocation happened to leave behind for at least one color
+channel, rather than a real pixel value or an explicit zero-fill. Nothing in the interpolation passes
+(direction detection, green reconstruction, or the diagonal red/blue reconstruction that ends up
+reading it here) checks that the region it is about to read was ever actually written; they just walk
+the image geometry unconditionally, so a decode that "failed" for part of the frame but is not treated
+as a hard, image-wide failure lets full-frame interpolation run over the un-populated remainder and
+read never-initialized memory. This is a robustness gap in the demosaic stage's handling of a raw
+payload that only partially, corruptly decoded -- not a classic fixed-size buffer overrun (the
+working-buffer allocation itself is large enough), but a content-uninitialized read inside memory the
+routine legitimately owns.
+
+fix_commit plausibility: NO -- the recorded fix_commit does not plausibly fix this crash, and this
+id's own fix_crash_overlap=0 already flags exactly that (zero overlap between the crash location and
+the commit's changed functions/files). The two files that commit touches belong to the camera/TIFF
+metadata-interpretation layer that runs once during header parsing, before any pixel data is unpacked
+at all -- specifically the logic that decides, for Adobe-DNG-style floating-point sample formats
+(sample-format-code 3, tied to a handful of TIFF compression codes), which pixel-loading routine
+pointer to install and which combinations of bit-depth/sample-format should instead be rejected as
+not a valid raw image up front. That code path runs long before the demosaic stage this crash actually
+lives in, is specific to a DNG floating-point encoding this Fujifilm-format input does not use, and
+shares no function or file with the crash trace.
+
+Stronger, mechanical evidence beyond the overlap heuristic: attempting to apply this id's stored patch
+diff directly against this id's own checked-out vulnerable source tree fails outright -- git rejects
+it because the context lines around the changed code do not match. The vulnerable snapshot's own
+source already refers to the DNG floating-point pixel-loader by a different (later-renamed) internal
+name than the one the diff's unchanged context lines expect, and that name-mismatch also affects a
+second, nearby validity-check condition the diff modifies in the same function. In other words, this
+diff was generated against a different point in this file's history than the actual commit this id
+was bisected to -- a concrete, reproducible sign that the day-granularity bisection that produced this
+id's recorded fix_commit landed on the wrong revision (most likely a commit that happened to land in
+the right nightly-build window but belongs to unrelated ongoing DNG-format work), not a commit that
+ever silences this crash. Treat the recorded fix_commit as unreliable for this id; the mechanism
+description above is derived independently from the crash trace and the decoder's own pipeline
+structure, not from that diff.
